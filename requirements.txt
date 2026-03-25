@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==21.0.1
+notion-client==2.2.1
+python-dotenv>=1.1.0
+anthropic>=0.40.0

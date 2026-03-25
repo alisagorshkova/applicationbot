@@ -180,7 +180,7 @@ def build_cowork_prompt(company: str, position: str, url: str, notion_url: str) 
         f"Компания: {company}\n"
         f"Позиция: {position}\n"
         f"Ссылка: {vacancy_ref}\n\n"
-        f"Мои навыки и профиль — в Notion: https://www.notion.so/32d1fdf1793480aab40de58e9ab428a1\n\n"
+        f"Мои навыки и профиль — в Notion: https://www.notion.so/Master-Profile-Form-Fill-32c1fdf179348195afe3c060db133b35?source=copy_link\n\n"
         f"Пожалуйста:\n"
         f"1. Прочитай вакансию\n"
         f"2. Сделай review моего CV под эту вакансию и предложи изменения\n"

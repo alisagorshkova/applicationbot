@@ -2,8 +2,10 @@ import os
 import re
 import json
 import logging
+import httpx
 from datetime import date, time
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
@@ -72,6 +74,112 @@ def get_tg_message_link(origin) -> str | None:
     return None
 
 
+# ─── URL fetcher ──────────────────────────────────────────────────────────────
+
+def fetch_job_page(url: str) -> str:
+    """Загружает страницу вакансии и возвращает очищенный текст."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        with httpx.Client(timeout=15, follow_redirects=True) as client:
+            resp = client.get(url, headers=headers)
+            resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"fetch_job_page failed for {url}: {e}")
+        return ""
+
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    # 1. JSON-LD структурированные данные (LinkedIn, Glassdoor, hh.ru и др.)
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            if isinstance(data, dict) and data.get("@type") == "JobPosting":
+                parts = []
+                if data.get("title"):
+                    parts.append(f"Позиция: {data['title']}")
+                org = data.get("hiringOrganization", {})
+                if isinstance(org, dict) and org.get("name"):
+                    parts.append(f"Компания: {org['name']}")
+                loc = data.get("jobLocation", {})
+                if isinstance(loc, dict):
+                    addr = loc.get("address", {})
+                    if isinstance(addr, dict):
+                        city = addr.get("addressLocality", "")
+                        country = addr.get("addressCountry", "")
+                        if city or country:
+                            parts.append(f"Локация: {', '.join(filter(None, [city, country]))}")
+                if data.get("employmentType"):
+                    parts.append(f"Тип: {data['employmentType']}")
+                if data.get("description"):
+                    desc_text = BeautifulSoup(data["description"], "lxml").get_text(
+                        separator="\n", strip=True
+                    )
+                    parts.append(f"\n{desc_text}")
+                if parts:
+                    return "\n".join(parts)
+        except Exception:
+            continue
+
+    # 2. LinkedIn-специфичные селекторы
+    if "linkedin.com" in url:
+        for sel in [
+            ".description__text",
+            ".job-description",
+            ".jobs-description__content",
+            "[class*='description']",
+        ]:
+            el = soup.select_one(sel)
+            if el:
+                return el.get_text(separator="\n", strip=True)
+
+    # 3. Универсальные селекторы
+    for sel in ["main", "article", "[class*='job']", "[class*='vacancy']", ".content"]:
+        el = soup.select_one(sel)
+        if el:
+            t = el.get_text(separator="\n", strip=True)
+            if len(t) > 300:
+                return t[:8000]
+
+    return ""
+
+
+def text_to_blocks(text: str) -> list:
+    """Конвертирует текст в Notion paragraph blocks (макс. 2000 символов каждый)."""
+    blocks = []
+    lines = text.split("\n")
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 1990:
+            if chunk.strip():
+                blocks.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{"type": "text", "text": {"content": chunk.strip()}}]
+                    },
+                })
+            chunk = line
+        else:
+            chunk = (chunk + "\n" + line) if chunk else line
+    if chunk.strip():
+        blocks.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": chunk.strip()}}]
+            },
+        })
+    return blocks[:99]  # Notion API: максимум 100 блоков за запрос
+
+
 # ─── Parsing & Notion ─────────────────────────────────────────────────────────
 
 def parse_vacancy(text: str) -> dict:
@@ -112,8 +220,10 @@ def parse_vacancy(text: str) -> dict:
     }
 
 
-def add_to_notion(company: str, position: str, url: str, comment: str) -> tuple[str, str]:
-    """Возвращает (notion_url, page_id)."""
+def add_to_notion(
+    company: str, position: str, url: str, comment: str, description: str = ""
+) -> tuple[str, str]:
+    """Возвращает (notion_url, page_id). description сохраняется в тело страницы."""
     properties = {
         "Компания": {"title": [{"text": {"content": company}}]},
         "Статус": {"select": {"name": "Откликнуться"}},
@@ -124,11 +234,14 @@ def add_to_notion(company: str, position: str, url: str, comment: str) -> tuple[
     if url:
         properties["Ссылка на вакансию"] = {"url": url}
     if comment:
-        properties["Комментарий"] = {"rich_text": [{"text": {"content": comment}}]}
+        properties["Комментарий"] = {"rich_text": [{"text": {"content": comment[:2000]}}]}
+
+    children = text_to_blocks(description) if description else []
 
     response = notion.pages.create(
         parent={"database_id": NOTION_DATABASE_ID},
         properties=properties,
+        children=children,
     )
     return response["url"], response["id"]
 
@@ -366,20 +479,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             source_name = origin.sender_user_name
 
     if not text.strip():
-        await message.reply_text("Не могу прочитать сообщение. Пришли текст с вакансией.")
+        await message.reply_text("Не могу прочитать сообщение. Пришли текст или ссылку на вакансию.")
         return
 
+    # Определяем URL из текста или entities
+    raw_url = (entity_urls[0] if entity_urls else None) or (
+        (lambda m: m.group(0) if m else None)(re.search(r'https?://[^\s\)\]\>\,]+', text))
+    )
+
+    # Если сообщение — только ссылка, загружаем страницу вакансии
+    fetched_description = ""
+    content_for_parsing = text
+    is_url_only = bool(raw_url) and len(text.strip().split()) <= 3
+
+    status_msg = None
+    if is_url_only and raw_url:
+        status_msg = await message.reply_text("⏳ Загружаю вакансию по ссылке…")
+        fetched_description = fetch_job_page(raw_url)
+        if fetched_description:
+            content_for_parsing = fetched_description
+            await status_msg.edit_text("⏳ Распознаю детали…")
+        else:
+            await status_msg.edit_text("⚠️ Не удалось загрузить страницу, пробую разобрать URL…")
+
     try:
-        data = parse_vacancy(text)
+        data = parse_vacancy(content_for_parsing)
 
         if data["company"] == "Не указано" and not data["position"]:
-            await message.reply_text(
+            reply_text = (
                 "Не удалось распознать вакансию — не нашёл ни компанию, ни позицию.\n"
                 "Попробуй переслать сообщение с более подробным описанием."
             )
+            if status_msg:
+                await status_msg.edit_text(reply_text)
+            else:
+                await message.reply_text(reply_text)
             return
 
-        final_url = tg_link or (entity_urls[0] if entity_urls else None) or data["url"]
+        final_url = tg_link or raw_url or data["url"]
 
         comment = data["comment"]
         if source_name:
@@ -390,6 +527,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             position=data["position"],
             url=final_url,
             comment=comment[:2000],
+            description=fetched_description,
         )
 
         # Обновляем notified_ids чтобы не дублировать в daily check
@@ -398,8 +536,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state["notified_ids"].append(page_id)
             save_state(state)
 
+        desc_note = " + полное описание" if fetched_description else ""
         reply = (
-            f"✅ Добавлено в Notion!\n\n"
+            f"✅ Добавлено в Notion{desc_note}!\n\n"
             f"🏢 Компания: {data['company']}\n"
             f"💼 Позиция: {data['position'] or '—'}\n"
             f"🔗 Ссылка: {final_url or '—'}\n"
@@ -413,7 +552,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
             [InlineKeyboardButton("⏭ Пропустить", callback_data=f"skip:{page_id}")]
         ])
-        await message.reply_text(reply, parse_mode="Markdown", reply_markup=keyboard)
+        if status_msg:
+            await status_msg.edit_text(reply, parse_mode="Markdown", reply_markup=keyboard)
+        else:
+            await message.reply_text(reply, parse_mode="Markdown", reply_markup=keyboard)
 
     except Exception as e:
         logger.error(f"Error: {e}")

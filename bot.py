@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import httpx
+import html
 from datetime import date, time
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -306,7 +307,7 @@ def build_cowork_prompt(company: str, position: str, url: str, notion_url: str) 
 
 def build_vacancy_list_message(vacancies: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
     """Компактный список вакансий — одна кнопка на каждую."""
-    text = f"📋 *Вакансии для отклика* — {len(vacancies)} шт.\n\nВыбери вакансию чтобы раскрыть детали:"
+    text = f"📋 <b>Вакансии для отклика</b> — {len(vacancies)} шт.\n\nВыбери вакансию чтобы раскрыть детали:"
     buttons = []
     for v in vacancies:
         label = f"🏢 {v['company']}  •  {v['position'] or '—'}"
@@ -339,7 +340,7 @@ async def daily_check(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=chat_id,
             text=text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=keyboard
         )
 
@@ -368,10 +369,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             url = props.get("Ссылка на вакансию", {}).get("url", "") or ""
             notion_url = page["url"]
 
+            display_url = url or notion_url
             text = (
-                f"🏢 *{company}*\n"
-                f"💼 {position or '—'}\n"
-                f"🔗 {url or notion_url}"
+                f"🏢 <b>{html.escape(company)}</b>\n"
+                f"💼 {html.escape(position or '—')}\n"
+                f"🔗 <a href=\"{html.escape(display_url)}\">{html.escape(display_url)}</a>"
             )
             keyboard = InlineKeyboardMarkup([
                 [
@@ -380,7 +382,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ],
                 [InlineKeyboardButton("⏭ Пропустить", callback_data=f"skip:{page_id}")]
             ])
-            await query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+            await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
         except Exception as e:
             await query.message.reply_text(f"Ошибка: {e}")
 
@@ -396,8 +398,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             prompt = build_cowork_prompt(company, position, url, notion_url)
             await query.message.reply_text(
-                f"📝 *Промпт для Claude Cowork:*\n\n```\n{prompt}\n```",
-                parse_mode="Markdown"
+                f"📝 <b>Промпт для Claude Cowork:</b>\n\n<pre>{html.escape(prompt)}</pre>",
+                parse_mode="HTML"
             )
         except Exception as e:
             await query.message.reply_text(f"Ошибка: {e}")
@@ -406,7 +408,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             update_notion_status(page_id, "Отклик отправлен")
             await query.edit_message_reply_markup(reply_markup=None)
-            await query.message.reply_text("✅ Статус обновлён: *Отклик отправлен*", parse_mode="Markdown")
+            await query.message.reply_text("✅ Статус обновлён: <b>Отклик отправлен</b>", parse_mode="HTML")
         except Exception as e:
             await query.message.reply_text(f"Ошибка обновления статуса: {e}")
 
@@ -414,7 +416,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             update_notion_status(page_id, "Отменено")
             await query.edit_message_reply_markup(reply_markup=None)
-            await query.message.reply_text("⏭ Статус обновлён: *Отменено*", parse_mode="Markdown")
+            await query.message.reply_text("⏭ Статус обновлён: <b>Отменено</b>", parse_mode="HTML")
         except Exception as e:
             await query.message.reply_text(f"Ошибка обновления статуса: {e}")
 
@@ -445,7 +447,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text, keyboard = build_vacancy_list_message(vacancies)
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 # ─── Message handler ───────────────────────────────────────────────────────────
@@ -538,12 +540,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         desc_note = " + полное описание" if fetched_description else ""
         reply = (
-            f"✅ Добавлено в Notion{desc_note}!\n\n"
-            f"🏢 Компания: {data['company']}\n"
-            f"💼 Позиция: {data['position'] or '—'}\n"
-            f"🔗 Ссылка: {final_url or '—'}\n"
+            f"✅ Добавлено в Notion{html.escape(desc_note)}!\n\n"
+            f"🏢 Компания: {html.escape(data['company'])}\n"
+            f"💼 Позиция: {html.escape(data['position'] or '—')}\n"
+            f"🔗 Ссылка: {html.escape(final_url or '—')}\n"
             f"📊 Статус: Откликнуться\n\n"
-            f"[Открыть в Notion]({notion_url})"
+            f"<a href=\"{html.escape(notion_url)}\">Открыть в Notion</a>"
         )
         keyboard = InlineKeyboardMarkup([
             [
@@ -553,9 +555,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⏭ Пропустить", callback_data=f"skip:{page_id}")]
         ])
         if status_msg:
-            await status_msg.edit_text(reply, parse_mode="Markdown", reply_markup=keyboard)
+            await status_msg.edit_text(reply, parse_mode="HTML", reply_markup=keyboard)
         else:
-            await message.reply_text(reply, parse_mode="Markdown", reply_markup=keyboard)
+            await message.reply_text(reply, parse_mode="HTML", reply_markup=keyboard)
 
     except Exception as e:
         logger.error(f"Error: {e}")

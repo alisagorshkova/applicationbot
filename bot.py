@@ -129,25 +129,56 @@ def fetch_job_page(url: str) -> str:
         except Exception:
             continue
 
-    # 2. LinkedIn-специфичные селекторы
+    # 2. Open Graph теги — работают для LinkedIn posts, Medium, большинства сайтов
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    og_desc  = soup.find("meta", attrs={"property": "og:description"})
+    og_parts = []
+    if og_title and og_title.get("content"):
+        og_parts.append(og_title["content"].strip())
+    if og_desc and og_desc.get("content"):
+        og_parts.append(og_desc["content"].strip())
+
+    # 3. LinkedIn-специфичные селекторы (job listings)
     if "linkedin.com" in url:
         for sel in [
             ".description__text",
             ".job-description",
             ".jobs-description__content",
+            ".feed-shared-update-v2__description",
             "[class*='description']",
         ]:
             el = soup.select_one(sel)
             if el:
-                return el.get_text(separator="\n", strip=True)
+                text = el.get_text(separator="\n", strip=True)
+                if len(text) > 100:
+                    # Дополняем OG-данными если они есть
+                    prefix = "\n".join(og_parts)
+                    return f"{prefix}\n\n{text}".strip() if prefix else text
 
-    # 3. Универсальные селекторы
+        # Для LinkedIn posts — OG тегов обычно достаточно
+        if og_parts:
+            # Добавляем slug из URL как подсказку для Claude
+            slug_match = re.search(r'/posts/[^/]+-(\d+)', url)
+            hint = ""
+            if "/posts/" in url:
+                # Декодируем Кириллицу из URL slug
+                slug = re.search(r'/posts/\w+-(.+?)-\d{19}', url)
+                if slug:
+                    raw_slug = slug.group(1).replace("-", " ")
+                    hint = f"\nТекст поста (из URL): {raw_slug}"
+            return "\n".join(og_parts) + hint
+
+    # 4. Универсальные селекторы
     for sel in ["main", "article", "[class*='job']", "[class*='vacancy']", ".content"]:
         el = soup.select_one(sel)
         if el:
             t = el.get_text(separator="\n", strip=True)
             if len(t) > 300:
                 return t[:8000]
+
+    # 5. Последний резерв — OG теги
+    if og_parts:
+        return "\n".join(og_parts)
 
     return ""
 
@@ -217,7 +248,7 @@ def parse_vacancy(text: str) -> dict:
         "company": (data.get("company") or "Не указано")[:100],
         "position": (data.get("position") or "")[:500],
         "url": url,
-        "comment": text.strip()[:2000],
+        "comment": text.strip()[:1990],
     }
 
 
@@ -228,14 +259,14 @@ def add_to_notion(
     properties = {
         "Компания": {"title": [{"text": {"content": company}}]},
         "Статус": {"select": {"name": "Откликнуться"}},
-        "Дата отклика": {"date": {"start": date.today().isoformat()}},
+        "Дата добавления": {"date": {"start": date.today().isoformat()}},
     }
     if position:
         properties["Позиция"] = {"rich_text": [{"text": {"content": position}}]}
     if url:
         properties["Ссылка на вакансию"] = {"url": url}
     if comment:
-        properties["Комментарий"] = {"rich_text": [{"text": {"content": comment[:2000]}}]}
+        properties["Комментарий"] = {"rich_text": [{"text": {"content": comment[:1990]}}]}
 
     children = text_to_blocks(description) if description else []
 
@@ -528,7 +559,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             company=data["company"],
             position=data["position"],
             url=final_url,
-            comment=comment[:2000],
+            comment=comment[:1990],
             description=fetched_description,
         )
 
